@@ -330,6 +330,29 @@ class TestConfig:
             c = ecp.Config.load()
             assert c.autoconnect is True  # default, not "yes"
 
+    def test_save_is_atomic(self, tmp_path):
+        cfg_path = tmp_path / "test.json"
+        cfg_path.write_text(json.dumps({"baud": 115200}))
+        with patch.object(ecp, "CONFIG_PATH", cfg_path):
+            # simulate a mid-write crash by forcing os.replace to raise and
+            # confirm the original file is intact and no .tmp is left behind
+            with patch("eclipse_pcr.os.replace", side_effect=OSError("boom")):
+                err = ecp.Config(baud=230400).save()
+                assert err is not None
+            assert cfg_path.read_text().strip().startswith("{")
+            assert json.loads(cfg_path.read_text())["baud"] == 115200
+            tmp = cfg_path.parent / (cfg_path.name + ".tmp")
+            assert not tmp.exists(), "stale .tmp file must be cleaned up"
+
+    def test_save_round_trip_via_tmp(self, tmp_path):
+        cfg_path = tmp_path / "test.json"
+        with patch.object(ecp, "CONFIG_PATH", cfg_path):
+            assert ecp.Config(baud=921600).save() is None
+            # no leftover tmp file after successful save
+            tmp = cfg_path.parent / (cfg_path.name + ".tmp")
+            assert not tmp.exists()
+            assert json.loads(cfg_path.read_text())["baud"] == 921600
+
 
 # =====================================================================================
 # Platform detection
@@ -582,6 +605,15 @@ class TestSimulator:
         stages = {d["stage"] for d in json_lines}
         assert len(stages) >= 1  # at least one stage observed
 
+    def test_double_start_does_not_leak_thread(self):
+        sim = ecp.Simulator(on_line=lambda l: None)
+        sim.start()
+        first = sim._thread
+        time.sleep(0.1)
+        sim.start()  # should be a no-op while running
+        assert sim._thread is first, "second start() must not replace the running thread"
+        sim.stop()
+
 
 # =====================================================================================
 # Textual TUI (pilot tests)
@@ -741,6 +773,96 @@ class TestTUI:
             dv.apply_telemetry({"stage": 12345})
             await pilot.pause()
             await pilot.press("ctrl+q")
+
+    @pytest.mark.asyncio
+    async def test_log_max_applied_on_mount(self, make_app, tmp_path):
+        cfg_path = tmp_path / "test.json"
+        cfg_path.write_text(json.dumps({"log_max": 1234}))
+        with patch.object(ecp, "CONFIG_PATH", cfg_path):
+            app = make_app()
+            async with app.run_test(headless=True, size=(120, 40)) as pilot:
+                await pilot.pause()
+                rl = app.query_one("#console-log", ecp.RichLog)
+                assert rl.max_lines == 1234
+                await pilot.press("ctrl+q")
+
+    @pytest.mark.asyncio
+    async def test_discard_refreshes_widgets(self, make_app, tmp_path):
+        cfg_path = tmp_path / "test.json"
+        cfg_path.write_text(json.dumps({
+            "baud": 230400,
+            "plot_window_s": 120,
+            "log_max": 2500,
+            "autoconnect": False,
+            "chip": "esp32s3",
+            "flash_baud": 921600,
+            "flash_entries": [["0x0", "boot.bin"], ["0x10000", "app.bin"]],
+        }))
+        with patch.object(ecp, "CONFIG_PATH", cfg_path):
+            app = make_app()
+            async with app.run_test(headless=True, size=(120, 40)) as pilot:
+                await pilot.pause()
+                # mutate the widgets to diverge from the saved config
+                sv = app.query_one(ecp.SettingsView)
+                sv.query_one("#cfg-baud", ecp.Input).value = "9600"
+                sv.query_one("#cfg-plot", ecp.Input).value = "5"
+                sv.query_one("#cfg-logmax", ecp.Input).value = "100"
+                fv = app.query_one(ecp.FlashView)
+                fv.query_one("#flash-chip", ecp.Input).value = "esp32c3"
+                fv.query_one("#flash-baud", ecp.Input).value = "115200"
+                await pilot.pause()
+
+                app.query_one(ecp.TabbedContent).active = "settings"
+                await pilot.pause()
+                await pilot.click("#cfg-discard")
+                await pilot.pause()
+                await asyncio.sleep(0.1)
+
+                assert sv.query_one("#cfg-baud", ecp.Input).value == "230400"
+                assert sv.query_one("#cfg-plot", ecp.Input).value == "120"
+                assert sv.query_one("#cfg-logmax", ecp.Input).value == "2500"
+                assert fv.query_one("#flash-chip", ecp.Input).value == "esp32s3"
+                assert fv.query_one("#flash-baud", ecp.Input).value == "921600"
+                rows = fv.all_rows()
+                assert rows == [("0x0", "boot.bin"), ("0x10000", "app.bin")]
+
+                rl = app.query_one("#console-log", ecp.RichLog)
+                assert rl.max_lines == 2500
+                pv = app.query_one(ecp.PlotView)
+                assert pv.window_s == 120
+                await pilot.press("ctrl+q")
+
+    @pytest.mark.asyncio
+    async def test_save_preserves_empty_flash_rows(self, make_app, tmp_path):
+        cfg_path = tmp_path / "test.json"
+        with patch.object(ecp, "CONFIG_PATH", cfg_path):
+            app = make_app()
+            async with app.run_test(headless=True, size=(120, 40)) as pilot:
+                await pilot.pause()
+                fv = app.query_one(ecp.FlashView)
+                app.query_one(ecp.TabbedContent).active = "flash"
+                await pilot.pause()
+                fv.query_one("#flash-entries", ecp.VerticalScroll).mount(ecp.FlashRow("0x1000", ""))
+                fv.query_one("#flash-entries", ecp.VerticalScroll).mount(ecp.FlashRow("0x20000", "fw.bin"))
+                await pilot.pause()
+
+                rows_before = fv.all_rows()
+                assert ("0x1000", "") in rows_before
+                assert ("0x20000", "fw.bin") in rows_before
+
+                app._cfg_save()
+                await pilot.pause()
+                data = json.loads(cfg_path.read_text())
+                saved = {tuple(r) for r in data["flash_entries"]}
+                # empty-path rows survive the round-trip
+                assert ("0x1000", "") in saved
+                assert ("0x20000", "fw.bin") in saved
+
+                # current_entries still filters empties for flash operations
+                active = fv.current_entries()
+                assert ("0x20000", "fw.bin") in active
+                assert ("0x1000", "") not in active
+                await pilot.press("ctrl+q")
 
 
 # =====================================================================================

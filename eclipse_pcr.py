@@ -23,6 +23,7 @@ from __future__ import annotations
 # Dependency bootstrap — auto-install on first run
 # =====================================================================================
 import importlib
+import importlib.util
 import os
 import subprocess
 import sys
@@ -36,12 +37,13 @@ _REQUIRED = [
 
 
 def _ensure_deps() -> None:
-    missing = []
-    for mod, spec in _REQUIRED:
+    def _installed(mod: str) -> bool:
         try:
-            importlib.import_module(mod)
-        except ImportError:
-            missing.append(spec)
+            return importlib.util.find_spec(mod) is not None
+        except (ImportError, ValueError):
+            return False
+
+    missing = [spec for mod, spec in _REQUIRED if not _installed(mod)]
     if not missing:
         return
     print(f"[eclipse_pcr] Installing missing dependencies: {', '.join(missing)}", flush=True)
@@ -474,6 +476,8 @@ class Simulator:
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="simulator", daemon=True)
         self._thread.start()
@@ -568,10 +572,16 @@ class Config:
 
     def save(self) -> str | None:
         """Save config. Returns None on success, or an error message."""
+        tmp = CONFIG_PATH.parent / (CONFIG_PATH.name + ".tmp")
         try:
-            CONFIG_PATH.write_text(json.dumps(asdict(self), indent=2))
+            tmp.write_text(json.dumps(asdict(self), indent=2))
+            os.replace(tmp, CONFIG_PATH)
             return None
         except OSError as e:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
             return f"Failed to save config: {e}"
 
 # =====================================================================================
@@ -960,14 +970,18 @@ class FlashView(Container):
         yield RichLog(id="flash-log", highlight=False, markup=False, wrap=False, max_lines=10000)
 
     def current_entries(self) -> list[tuple[str, str]]:
+        """Rows with non-empty paths — used when firing a flash operation."""
+        return [(off, path) for off, path in self.all_rows() if path]
+
+    def all_rows(self) -> list[tuple[str, str]]:
+        """Every row in the UI, including empty paths — used when persisting."""
         out: list[tuple[str, str]] = []
         for row in self.query(FlashRow):
             inputs = row.query(Input)
             if len(inputs) >= 2:
                 off = inputs[0].value.strip() or "0x0"
                 path = inputs[1].value.strip()
-                if path:
-                    out.append((off, path))
+                out.append((off, path))
         return out
 
     def log(self, text: str, style: str | None = None) -> None:
@@ -991,6 +1005,27 @@ class FlashView(Container):
             return int(self.query_one("#flash-baud", Input).value.strip())
         except Exception:
             return DEFAULT_FLASH_BAUD
+
+    def refresh_from_cfg(self, cfg: Config) -> None:
+        """Write cfg values back into the widgets (used after Discard)."""
+        self._cfg = cfg
+        try:
+            self.query_one("#flash-chip", Input).value = cfg.chip
+        except Exception:
+            pass
+        try:
+            self.query_one("#flash-baud", Input).value = str(cfg.flash_baud)
+        except Exception:
+            pass
+        try:
+            container = self.query_one("#flash-entries", VerticalScroll)
+            for row in list(self.query(FlashRow)):
+                row.remove()
+            entries = cfg.flash_entries or [["0x0", ""]]
+            for off, path in entries:
+                container.mount(FlashRow(off, path))
+        except Exception:
+            pass
 
 
 class SettingsView(Container):
@@ -1095,6 +1130,30 @@ class SettingsView(Container):
         try: cfg.log_max = _int(self.query_one("#cfg-logmax", Input).value, cfg.log_max)
         except Exception: pass
 
+    def refresh_from_cfg(self, cfg: Config) -> None:
+        """Write cfg values back into the widgets (used after Discard)."""
+        self._cfg = cfg
+        try:
+            sel = self.query_one("#cfg-port", Select)
+            sel.set_options(self._port_options())
+            match = next((v for _lbl, v in self._port_options() if v == cfg.port), None)
+            sel.value = match if match is not None else Select.BLANK
+        except Exception:
+            pass
+        for iid, val in (
+            ("#cfg-baud", str(cfg.baud)),
+            ("#cfg-plot", str(cfg.plot_window_s)),
+            ("#cfg-logmax", str(cfg.log_max)),
+        ):
+            try:
+                self.query_one(iid, Input).value = val
+            except Exception:
+                pass
+        try:
+            self.query_one("#cfg-autoconnect", Switch).value = cfg.autoconnect
+        except Exception:
+            pass
+
 # =====================================================================================
 # The main app
 # =====================================================================================
@@ -1141,7 +1200,8 @@ class EclipsePCRApp(App):
             on_status=self._on_serial_status_threadsafe,
         )
         self._sim = Simulator(on_line=self._on_serial_line_threadsafe) if self.simulate else None
-        self._flash_proc: subprocess.Popen[bytes] | None = None
+        self._flash_proc: subprocess.Popen | None = None
+        self._flash_pending: bool = False
         self._last_press: dict[str, float] = {}
 
     # ------------------------------------------------------------------ layout
@@ -1166,6 +1226,10 @@ class EclipsePCRApp(App):
         try:
             pv = self.query_one(PlotView)
             pv.window_s = self.cfg.plot_window_s
+        except Exception:
+            pass
+        try:
+            self.query_one("#console-log", RichLog).max_lines = self.cfg.log_max
         except Exception:
             pass
         self.query_one(SettingsView).rescan()
@@ -1314,8 +1378,8 @@ class EclipsePCRApp(App):
     def _cfg_save(self) -> None:
         sv = self.query_one(SettingsView)
         sv.read_into(self.cfg)
-        # persist current flash entries too
-        self.cfg.flash_entries = [[off, path] for off, path in self.query_one(FlashView).current_entries()] or [["0x0", ""]]
+        # persist every row the user sees, including empty-path placeholders
+        self.cfg.flash_entries = [[off, path] for off, path in self.query_one(FlashView).all_rows()] or [["0x0", ""]]
         try:
             self.cfg.chip = self.query_one(FlashView).chip()
             self.cfg.flash_baud = self.query_one(FlashView).baud()
@@ -1326,6 +1390,10 @@ class EclipsePCRApp(App):
             self.query_one(PlotView).window_s = self.cfg.plot_window_s
         except Exception:
             pass
+        try:
+            self.query_one("#console-log", RichLog).max_lines = self.cfg.log_max
+        except Exception:
+            pass
         if err:
             self.query_one(ConsoleView).log(err, style="bold red")
         else:
@@ -1334,6 +1402,22 @@ class EclipsePCRApp(App):
     @on(Button.Pressed, "#cfg-discard")
     def _cfg_discard(self) -> None:
         self.cfg = Config.load()
+        try:
+            self.query_one(SettingsView).refresh_from_cfg(self.cfg)
+        except Exception:
+            pass
+        try:
+            self.query_one(FlashView).refresh_from_cfg(self.cfg)
+        except Exception:
+            pass
+        try:
+            self.query_one(PlotView).window_s = self.cfg.plot_window_s
+        except Exception:
+            pass
+        try:
+            self.query_one("#console-log", RichLog).max_lines = self.cfg.log_max
+        except Exception:
+            pass
         self.query_one(ConsoleView).log("Config reloaded from disk.", style="yellow")
 
     # Flash tab
@@ -1402,18 +1486,23 @@ class EclipsePCRApp(App):
         if proc.poll() is None:
             try:
                 proc.kill()
-                self.call_from_thread(
-                    self.query_one(FlashView).log,
-                    "Abort: SIGKILL sent (process did not respond to SIGTERM).",
-                    "bold red",
-                )
             except Exception:
-                pass
+                return
+            self.call_from_thread(self._log_flash_kill)
+
+    def _log_flash_kill(self) -> None:
+        try:
+            self.query_one(FlashView).log(
+                "Abort: SIGKILL sent (process did not respond to SIGTERM).",
+                style="bold red",
+            )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ esptool runner
     def _run_esptool(self, extra_args: list[str], *, require_confirm: str | None = None) -> None:
         fv = self.query_one(FlashView)
-        if self._flash_proc and self._flash_proc.poll() is None:
+        if self._flash_pending or (self._flash_proc and self._flash_proc.poll() is None):
             fv.log("An esptool operation is already running.", style="red")
             return
         port = self.cfg.port
@@ -1442,6 +1531,7 @@ class EclipsePCRApp(App):
 
         argv = [sys.executable, "-m", "esptool", "--chip", chip, "--port", port, *extra_args]
         fv.log(f"$ {' '.join(argv)}", style="bold")
+        self._flash_pending = True
         try:
             self.query_one("#flash-abort", Button).disabled = False
             self.query_one("#flash-go", Button).disabled = True
@@ -1459,11 +1549,14 @@ class EclipsePCRApp(App):
                 argv,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,
             )
             assert self._flash_proc.stdout is not None
-            for raw in iter(self._flash_proc.stdout.readline, b""):
-                line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            for line in iter(self._flash_proc.stdout.readline, ""):
+                line = line.rstrip("\r\n")
                 if line:
                     self.call_from_thread(self._flash_log_line, line)
             rc = self._flash_proc.wait()
@@ -1478,8 +1571,10 @@ class EclipsePCRApp(App):
 
     def _flash_log_line(self, line: str) -> None:
         style = None
-        low = line.lower()
-        if "error" in low or "fatal" in low:
+        low = line.lstrip().lower()
+        # esptool prefixes real errors with "A fatal error" or "error:"; prefix match
+        # avoids false positives like "no errors encountered".
+        if low.startswith("error") or low.startswith("a fatal error") or low.startswith("fatal"):
             style = "red"
         elif "wrote" in low or "hash of data verified" in low or "leaving" in low:
             style = "green"
@@ -1491,6 +1586,7 @@ class EclipsePCRApp(App):
             pass
 
     def _flash_finished(self, reconnect: bool) -> None:
+        self._flash_pending = False
         try:
             self.query_one("#flash-abort", Button).disabled = True
             self.query_one("#flash-go", Button).disabled = False
@@ -1509,7 +1605,7 @@ class EclipsePCRApp(App):
             sb.stale = self._serial.stale
             s = self._serial
             if s.connected or s.bytes_rx > 0:
-                sb.stats_text = f"rx:{s.bytes_rx}B  tx:{s.bytes_tx}B  lines:{s.lines_rx}"
+                sb.stats_text = f"rx:{s.bytes_rx:,}B  tx:{s.bytes_tx:,}B  lines:{s.lines_rx:,}"
             else:
                 sb.stats_text = ""
         except Exception:
