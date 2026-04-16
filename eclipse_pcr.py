@@ -471,9 +471,13 @@ def _sanitize_telemetry(d: dict[str, Any]) -> dict[str, Any]:
             continue
         if isinstance(v, float) and not math.isfinite(v):
             continue
-        # reject deeply nested objects — telemetry should be flat
-        if isinstance(v, (dict, list)):
+        if isinstance(v, dict):
             continue
+        if isinstance(v, list):
+            # Allow flat lists of primitives (e.g. "fault": ["open","tc_high"]).
+            # Reject nested containers to keep telemetry shallow.
+            if any(isinstance(x, (dict, list)) for x in v):
+                continue
         out[k] = v
     return out if out else None
 
@@ -1223,6 +1227,7 @@ class EclipsePCRApp(App):
         self._flash_proc: subprocess.Popen | None = None
         self._flash_pending: bool = False
         self._last_press: dict[str, float] = {}
+        self._last_fault_str: str = ""
 
     # ------------------------------------------------------------------ layout
     def compose(self) -> ComposeResult:
@@ -1314,18 +1319,34 @@ class EclipsePCRApp(App):
         if "err" in data or "error" in data:
             msg = data.get("err") or data.get("error")
             console.log(f"!! {msg}", style="bold red")
+        fault = data.get("fault")
+        if fault:
+            if isinstance(fault, (list, tuple)):
+                fault_str = ", ".join(str(f) for f in fault)
+            else:
+                fault_str = str(fault)
+            if fault_str != self._last_fault_str:
+                console.log(f"!! TC fault: {fault_str}", style="bold red")
+                self._last_fault_str = fault_str
+        elif self._last_fault_str:
+            console.log("TC fault cleared", style="green")
+            self._last_fault_str = ""
 
     def _on_hello(self, data: dict[str, Any]) -> None:
         fw = str(data.get("fw") or "unknown")
         ver = str(data.get("version") or "?")
         parts = [f"{fw} {ver}"]
-        for key in ("chip", "mpy", "mac", "reset_cause"):
+        for key in ("chip", "mpy", "mac", "reset_cause", "tc_sensor", "tc_type"):
             v = data.get(key)
-            if v:
+            if v not in (None, ""):
                 parts.append(f"{key}={v}")
         self.query_one(ConsoleView).log("[fw] " + "  ".join(parts), style="bold green")
         try:
-            self.query_one(StatusBar).fw_info = f"{fw} {ver}"
+            sb = self.query_one(StatusBar)
+            sb.fw_info = f"{fw} {ver}"
+            sensor = str(data.get("tc_sensor") or "")
+            if sensor and sensor != "absent":
+                sb.fw_info += f" / {sensor}"
         except Exception:
             pass
 

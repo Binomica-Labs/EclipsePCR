@@ -83,8 +83,13 @@ class TestParseTelemetry:
         d = ecp.parse_telemetry('{"tc": 67.3, "nested": {"a": 1}}')
         assert "nested" not in d
 
-    def test_json_nested_list_stripped(self):
-        d = ecp.parse_telemetry('{"tc": 67.3, "vals": [1, 2, 3]}')
+    def test_flat_list_preserved(self):
+        # flat lists (e.g. fault lists) are allowed through
+        d = ecp.parse_telemetry('{"tc": 67.3, "fault": ["open", "tc_high"]}')
+        assert d["fault"] == ["open", "tc_high"]
+
+    def test_nested_list_stripped(self):
+        d = ecp.parse_telemetry('{"tc": 67.3, "vals": [[1,2],[3,4]]}')
         assert "vals" not in d
 
     def test_very_long_line(self):
@@ -216,8 +221,12 @@ class TestSanitizeTelemetry:
         d = ecp._sanitize_telemetry({"tc": 67.3, "extra": {"a": 1}})
         assert "extra" not in d
 
+    def test_keeps_flat_list(self):
+        d = ecp._sanitize_telemetry({"tc": 67.3, "fault": ["open"]})
+        assert d["fault"] == ["open"]
+
     def test_strips_nested_list(self):
-        d = ecp._sanitize_telemetry({"tc": 67.3, "extra": [1, 2]})
+        d = ecp._sanitize_telemetry({"tc": 67.3, "extra": [[1, 2]]})
         assert "extra" not in d
 
     def test_strips_non_string_keys(self):
@@ -226,7 +235,7 @@ class TestSanitizeTelemetry:
         assert d["tc"] == 67.3
 
     def test_all_stripped_returns_none(self):
-        d = ecp._sanitize_telemetry({"a": float("inf"), "b": [1, 2]})
+        d = ecp._sanitize_telemetry({"a": float("inf"), "b": {"x": 1}})
         assert d is None
 
     def test_none_value_preserved(self):
@@ -761,17 +770,36 @@ class TestTUI:
     @pytest.mark.asyncio
     async def test_hello_sets_fw_info(self, make_app):
         app = make_app(simulate=False)
+        app.cfg.autoconnect = False  # don't latch onto a real board during tests
         async with app.run_test(headless=True, size=(120, 40)) as pilot:
             await pilot.pause()
             sb = app.query_one(ecp.StatusBar)
             dv = app.query_one(ecp.DashboardView)
             before = dv.query_one("#tile-tc", ecp.Tile)._value
-            hello = '{"type":"hello","fw":"eclipse_pcr","version":"9.9.9","chip":"ESP32C6","mac":"58:e6:c5:12:e0:7c","reset_cause":"power_on"}'
+            hello = '{"type":"hello","fw":"eclipse_pcr","version":"9.9.9","chip":"ESP32C6","mac":"58:e6:c5:12:e0:7c","reset_cause":"power_on","tc_sensor":"max31856","tc_type":"K"}'
             app._on_serial_line(hello)
             await pilot.pause()
-            assert sb.fw_info == "eclipse_pcr 9.9.9"
+            assert sb.fw_info.startswith("eclipse_pcr 9.9.9")
+            assert "max31856" in sb.fw_info  # sensor appears in the info line
             # hello must not be mistaken for a telemetry frame
             assert dv.query_one("#tile-tc", ecp.Tile)._value == before
+            await pilot.press("ctrl+q")
+
+    @pytest.mark.asyncio
+    async def test_tc_fault_logs_once_until_cleared(self, make_app):
+        app = make_app(simulate=False)
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            await pilot.pause()
+            # two frames with the same fault — only one log line
+            app._on_serial_line('{"t":1,"tc":25.0,"fault":["open"]}')
+            app._on_serial_line('{"t":2,"tc":25.0,"fault":["open"]}')
+            assert app._last_fault_str == "open"
+            # faults clear — a single "cleared" line
+            app._on_serial_line('{"t":3,"tc":25.0}')
+            assert app._last_fault_str == ""
+            # new fault after clear — re-log
+            app._on_serial_line('{"t":4,"tc":25.0,"fault":["tc_high","open"]}')
+            assert app._last_fault_str == "tc_high, open"
             await pilot.press("ctrl+q")
 
     @pytest.mark.asyncio
