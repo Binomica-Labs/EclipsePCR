@@ -196,13 +196,137 @@ def wsl_helper_hint() -> str:
         "Your ESP32-C6 should then appear as /dev/ttyACM0 inside WSL."
     )
 
+
+_USBIPD_PATHS = (
+    "/mnt/c/Program Files/usbipd-win/usbipd.exe",
+    "/mnt/c/Program Files (x86)/usbipd-win/usbipd.exe",
+)
+
+# Espressif USB-Serial/JTAG VIDs (ESP32-C3/S3/C6 built-in USB, plus common bridges)
+_USBIPD_TARGET_VIDS = ("303a", "10c4", "1a86", "0403")
+
+
+def _find_usbipd() -> str | None:
+    for p in _USBIPD_PATHS:
+        if Path(p).exists():
+            return p
+    return None
+
+
+def wsl_usbipd_recycle(target_vids: tuple[str, ...] = _USBIPD_TARGET_VIDS) -> bool:
+    """Detach+reattach any matching usbipd device to kick a stuck vhci_hcd tunnel.
+
+    Returns True if at least one device was reattached. Cheap no-op off WSL.
+    """
+    if PLATFORM != "wsl":
+        return False
+    usbipd = _find_usbipd()
+    if usbipd is None:
+        return False
+    try:
+        out = subprocess.run(
+            [usbipd, "list"], capture_output=True, timeout=5, check=False,
+        ).stdout.decode("utf-8", errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        return False
+    busids: list[str] = []
+    in_connected = False
+    for line in out.splitlines():
+        s = line.strip()
+        if s.startswith("Connected"):
+            in_connected = True; continue
+        if s.startswith("Persisted"):
+            in_connected = False; continue
+        if not in_connected or not s or s.startswith("BUSID"):
+            continue
+        parts = s.split()
+        if len(parts) < 4:
+            continue
+        busid, vidpid = parts[0], parts[1]
+        vid = vidpid.split(":", 1)[0].lower()
+        if vid in target_vids:
+            busids.append(busid)
+    if not busids:
+        return False
+    ok = False
+    for busid in busids:
+        try:
+            subprocess.run(
+                [usbipd, "detach", "--busid", busid],
+                capture_output=True, timeout=10, check=False,
+            )
+            # usbipd briefly loses the busid between detach and device
+            # re-enumeration — give Windows time to settle.
+            for attempt in range(6):
+                time.sleep(1.0)
+                r = subprocess.run(
+                    [usbipd, "attach", "--wsl", "--busid", busid],
+                    capture_output=True, timeout=10, check=False,
+                )
+                if r.returncode == 0:
+                    ok = True
+                    break
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if ok:
+        time.sleep(0.5)
+    return ok
+
+
+def wsl_auto_attach(target_vids: tuple[str, ...] = _USBIPD_TARGET_VIDS) -> list[str]:
+    """On WSL, try to attach any usbipd-Shared devices whose VID matches. Returns busids attached."""
+    if PLATFORM != "wsl":
+        return []
+    usbipd = _find_usbipd()
+    if usbipd is None:
+        return []
+    try:
+        out = subprocess.run(
+            [usbipd, "list"],
+            capture_output=True, timeout=5, check=False,
+        ).stdout.decode("utf-8", errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        return []
+    attached: list[str] = []
+    in_connected = False
+    for line in out.splitlines():
+        s = line.strip()
+        if s.startswith("Connected"):
+            in_connected = True
+            continue
+        if s.startswith("Persisted"):
+            in_connected = False
+            continue
+        if not in_connected or not s or s.startswith("BUSID"):
+            continue
+        parts = s.split()
+        if len(parts) < 4:
+            continue
+        busid, vidpid = parts[0], parts[1]
+        state = parts[-1]
+        vid = vidpid.split(":", 1)[0].lower()
+        if vid not in target_vids or state == "Attached":
+            continue
+        try:
+            subprocess.run(
+                [usbipd, "attach", "--wsl", "--busid", busid],
+                capture_output=True, timeout=10, check=True,
+            )
+            attached.append(busid)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return attached
+
 # =====================================================================================
 # Serial worker — pyserial in a background thread, line-based I/O
 # =====================================================================================
-MAX_RX_BUF = 65536       # discard partial line if buffer exceeds this (binary garbage protection)
+MAX_RX_BUF = 65536        # discard partial line if buffer exceeds this (binary garbage protection)
 MAX_LINE_LEN = 4096       # ignore lines longer than this
 MAX_TX_QUEUE = 256        # drop oldest if command queue overflows
 STALE_TIMEOUT_S = 10.0    # "no data" warning threshold while connected
+STALE_RECONNECT_S = 25.0  # no data for this long → tear down and reopen the port
+OPEN_RETRIES = 3          # bounded retries on the initial port open
+OPEN_RETRY_DELAY_S = 0.4
 
 
 @dataclass
@@ -231,9 +355,11 @@ class SerialWorker:
         self._ser: pyserial.Serial | None = None
         self._status = SerialStatus()
         self.last_rx_time: float = 0.0
+        self._connected_at: float = 0.0
         self.bytes_rx: int = 0
         self.bytes_tx: int = 0
         self.lines_rx: int = 0
+        self.reconnects: int = 0
 
     @property
     def status(self) -> SerialStatus:
@@ -247,7 +373,8 @@ class SerialWorker:
     def stale(self) -> bool:
         if not self.connected:
             return False
-        return self.last_rx_time > 0 and (time.monotonic() - self.last_rx_time) > STALE_TIMEOUT_S
+        ref = self.last_rx_time if self.last_rx_time > 0 else self._connected_at
+        return ref > 0 and (time.monotonic() - ref) > STALE_TIMEOUT_S
 
     def _set_status(self, **kw) -> None:
         for k, v in kw.items():
@@ -354,25 +481,16 @@ class SerialWorker:
 
     def _run(self, port: str, baud: int) -> None:
         backoff = 0.5
+        tried_wsl_reattach = False
         while not self._stop.is_set():
             buf = b""
             try:
                 self._set_status(state="connecting", detail=f"{port} @ {baud}", port=port, baud=baud)
-                # Open with DTR/RTS both asserted. On ESP32-C6 USB-Serial/JTAG
-                # that matches the chip's "no reset" state, so reconnecting
-                # the TUI doesn't reboot the firmware mid-run. (Caveat: boards
-                # wired through an external CP210x/CH340 auto-reset RC circuit
-                # would do the opposite — flip these to False for that setup.)
-                ser = pyserial.Serial()
-                ser.port = port
-                ser.baudrate = baud
-                ser.timeout = 0.1
-                ser.dsrdtr = False
-                ser.rtscts = False
-                ser.dtr = True
-                ser.rts = True
-                ser.open()
+                ser = self._open_with_retries(port, baud)
                 self._ser = ser
+                self._connected_at = time.monotonic()
+                self.last_rx_time = 0.0
+                tried_wsl_reattach = False
                 self._set_status(state="connected", detail=f"{port} @ {baud}")
                 backoff = 0.5
                 while not self._stop.is_set():
@@ -400,8 +518,23 @@ class SerialWorker:
                                     self._on_line(s)
                                 except Exception:
                                     pass
+                    else:
+                        # Connected but silent. After STALE_RECONNECT_S of no
+                        # data, the USB endpoint may be stuck (seen on WSL's
+                        # vhci_hcd tunnel) — force a reopen.
+                        ref = self.last_rx_time if self.last_rx_time > 0 else self._connected_at
+                        if ref and (time.monotonic() - ref) > STALE_RECONNECT_S:
+                            raise pyserial.SerialException(
+                                f"no data for >{STALE_RECONNECT_S:.0f}s; forcing reconnect"
+                            )
             except (pyserial.SerialException, OSError) as e:
                 self._set_status(state="error", detail=_friendly_serial_error(port, e))
+                # One-shot WSL recovery: when the tunnel is stuck, detach+reattach
+                # usually clears it without needing a full `wsl --shutdown`.
+                if PLATFORM == "wsl" and not tried_wsl_reattach:
+                    tried_wsl_reattach = True
+                    if wsl_usbipd_recycle():
+                        self._set_status(state="connecting", detail="usbipd recycled; retrying…")
             except Exception as e:
                 self._set_status(state="error", detail=f"{type(e).__name__}: {e}")
             finally:
@@ -411,6 +544,8 @@ class SerialWorker:
                 except Exception:
                     pass
                 self._ser = None
+                self._connected_at = 0.0
+                self.reconnects += 1
             if self._stop.is_set():
                 break
             self._set_status(state="connecting", detail=f"reconnecting in {backoff:.1f}s")
@@ -418,6 +553,36 @@ class SerialWorker:
                 break
             backoff = min(backoff * 2, 5.0)
         self._set_status(state="disconnected", detail="")
+
+    def _open_with_retries(self, port: str, baud: int) -> pyserial.Serial:
+        last_err: BaseException | None = None
+        for attempt in range(1, OPEN_RETRIES + 1):
+            if self._stop.is_set():
+                raise pyserial.SerialException("stopped before open")
+            try:
+                ser = pyserial.Serial()
+                ser.port = port
+                ser.baudrate = baud
+                ser.timeout = 0.1
+                ser.dsrdtr = False
+                ser.rtscts = False
+                # DTR/RTS both asserted = "no reset" on ESP32-C6 USB-Serial/JTAG.
+                # (For CP210x/CH340 boards with an auto-reset RC, flip these.)
+                ser.dtr = True
+                ser.rts = True
+                ser.open()
+                return ser
+            except (pyserial.SerialException, OSError) as e:
+                last_err = e
+                if attempt < OPEN_RETRIES and not self._stop.is_set():
+                    self._set_status(
+                        state="connecting",
+                        detail=f"{port} @ {baud}  (open retry {attempt}/{OPEN_RETRIES - 1})",
+                    )
+                    if self._stop.wait(OPEN_RETRY_DELAY_S):
+                        raise pyserial.SerialException("stopped during open retry")
+        assert last_err is not None
+        raise last_err
 
 # =====================================================================================
 # Telemetry parser
@@ -1117,13 +1282,22 @@ class SettingsView(Container):
         return opts
 
     def rescan(self) -> None:
+        ports = self._ports_provider()
+        attached_msg = ""
+        if not ports and PLATFORM == "wsl":
+            attached = wsl_auto_attach()
+            if attached:
+                attached_msg = f"[wsl] auto-attached {', '.join(attached)} via usbipd"
+                time.sleep(0.5)
+                ports = self._ports_provider()
         try:
             sel = self.query_one("#cfg-port", Select)
             sel.set_options(self._port_options())
         except Exception:
             pass
-        ports = self._ports_provider()
         lines: list[str] = []
+        if attached_msg:
+            lines.append(attached_msg)
         if not ports:
             lines.append(wsl_helper_hint() if PLATFORM == "wsl" else "No serial ports detected.")
         else:
@@ -1269,6 +1443,16 @@ class EclipsePCRApp(App):
             port = self.cfg.port
             if not port:
                 ports = list_serial_ports()
+                if not ports and PLATFORM == "wsl":
+                    # Try pulling shared USB devices in from Windows before giving up.
+                    attached = wsl_auto_attach()
+                    if attached:
+                        self.query_one(ConsoleView).log(
+                            f"[wsl] auto-attached {', '.join(attached)} via usbipd",
+                            style="cyan",
+                        )
+                        time.sleep(0.5)
+                        ports = list_serial_ports()
                 if ports:
                     port = ports[0].device
             if port:
@@ -1777,6 +1961,16 @@ def _friendly_serial_error(port: str, exc: BaseException) -> str:
         return f"{msg}  |  {tail}"
     if "device busy" in low or (isinstance(exc, OSError) and getattr(exc, "errno", None) == 16):
         return f"{msg}  |  another program is holding the port (screen/minicom/esptool?)"
+    if (
+        "readiness to read but returned no data" in low
+        or "forcing reconnect" in low
+    ):
+        if PLATFORM == "wsl":
+            return (
+                f"{msg}  |  WSL vhci_hcd tunnel went silent; trying usbipd detach/attach. "
+                f"If that fails: `wsl --shutdown` from an admin PowerShell, then reopen."
+            )
+        return f"{msg}  |  USB endpoint stalled; the TUI will retry"
     return msg
 
 # =====================================================================================

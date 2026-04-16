@@ -495,6 +495,20 @@ class TestSerialWorker:
 
         w.disconnect()
 
+    def test_stale_without_any_data(self, pty_pair):
+        """Connected but no data ever → stale once we're past STALE_TIMEOUT_S."""
+        master, slave, port = pty_pair
+        w = ecp.SerialWorker(on_line=lambda l: None, on_status=lambda s: None)
+        w.connect(port, 115200)
+        time.sleep(0.3)
+        assert w.connected
+        assert not w.stale  # fresh connection, grace period
+        # shift _connected_at into the past so stale kicks in without any rx_time
+        w._connected_at = time.monotonic() - ecp.STALE_TIMEOUT_S - 1
+        assert w.last_rx_time == 0.0
+        assert w.stale
+        w.disconnect()
+
     def test_send_when_disconnected(self):
         w = ecp.SerialWorker(on_line=lambda l: None, on_status=lambda s: None)
         assert w.send("test") is False
@@ -550,6 +564,59 @@ class TestSerialWorker:
         # but unpausing shouldn't crash
         assert w.status.state == "connected"
         w.disconnect()
+
+    def test_wsl_helpers_noop_off_wsl(self):
+        """wsl_auto_attach / wsl_usbipd_recycle should be safe no-ops when not on WSL."""
+        with patch.object(ecp, "PLATFORM", "linux"):
+            assert ecp.wsl_auto_attach() == []
+            assert ecp.wsl_usbipd_recycle() is False
+
+    def test_wsl_helpers_safe_when_usbipd_missing(self):
+        """Even on WSL, missing usbipd.exe shouldn't crash the helpers."""
+        with patch.object(ecp, "PLATFORM", "wsl"), \
+             patch.object(ecp, "_find_usbipd", return_value=None):
+            assert ecp.wsl_auto_attach() == []
+            assert ecp.wsl_usbipd_recycle() is False
+
+    def test_open_retries_recovers_from_transient(self):
+        """First open() fails, second succeeds → _open_with_retries returns the good serial."""
+        w = ecp.SerialWorker(on_line=lambda l: None, on_status=lambda s: None)
+        attempts = {"n": 0}
+        good = MagicMock()
+        good.open = MagicMock()
+
+        class _FlakySerial:
+            def __init__(self, *a, **kw):
+                attempts["n"] += 1
+                self._opened = False
+                self.port = None; self.baudrate = None; self.timeout = None
+                self.dsrdtr = None; self.rtscts = None
+                self.dtr = None; self.rts = None
+            def open(self):
+                if attempts["n"] == 1:
+                    raise ecp.pyserial.SerialException("transient")
+                self._opened = True
+
+        with patch.object(ecp.pyserial, "Serial", _FlakySerial):
+            ser = w._open_with_retries("/dev/fake", 115200)
+            assert ser._opened is True
+            assert attempts["n"] == 2
+
+    def test_open_retries_gives_up(self):
+        """Persistent open failure raises through after all retries."""
+        w = ecp.SerialWorker(on_line=lambda l: None, on_status=lambda s: None)
+
+        class _AlwaysFails:
+            def __init__(self, *a, **kw):
+                self.port = None; self.baudrate = None; self.timeout = None
+                self.dsrdtr = None; self.rtscts = None
+                self.dtr = None; self.rts = None
+            def open(self):
+                raise ecp.pyserial.SerialException("nope")
+
+        with patch.object(ecp.pyserial, "Serial", _AlwaysFails):
+            with pytest.raises(ecp.pyserial.SerialException):
+                w._open_with_retries("/dev/fake", 115200)
 
     def test_counters_increment(self, pty_pair):
         master, slave, port = pty_pair
