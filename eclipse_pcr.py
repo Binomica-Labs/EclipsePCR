@@ -358,7 +358,20 @@ class SerialWorker:
             buf = b""
             try:
                 self._set_status(state="connecting", detail=f"{port} @ {baud}", port=port, baud=baud)
-                ser = pyserial.Serial(port, baud, timeout=0.1)
+                # Open with DTR/RTS both asserted. On ESP32-C6 USB-Serial/JTAG
+                # that matches the chip's "no reset" state, so reconnecting
+                # the TUI doesn't reboot the firmware mid-run. (Caveat: boards
+                # wired through an external CP210x/CH340 auto-reset RC circuit
+                # would do the opposite — flip these to False for that setup.)
+                ser = pyserial.Serial()
+                ser.port = port
+                ser.baudrate = baud
+                ser.timeout = 0.1
+                ser.dsrdtr = False
+                ser.rtscts = False
+                ser.dtr = True
+                ser.rts = True
+                ser.open()
                 self._ser = ser
                 self._set_status(state="connected", detail=f"{port} @ {baud}")
                 backoff = 0.5
@@ -388,7 +401,7 @@ class SerialWorker:
                                 except Exception:
                                     pass
             except (pyserial.SerialException, OSError) as e:
-                self._set_status(state="error", detail=str(e))
+                self._set_status(state="error", detail=_friendly_serial_error(port, e))
             except Exception as e:
                 self._set_status(state="error", detail=f"{type(e).__name__}: {e}")
             finally:
@@ -673,7 +686,9 @@ class StatusBar(Static):
     status: reactive[SerialStatus] = reactive(SerialStatus())
     sim: reactive[bool] = reactive(False)
     stale: reactive[bool] = reactive(False)
+    awaiting: reactive[bool] = reactive(False)
     stats_text: reactive[str] = reactive("")
+    fw_info: reactive[str] = reactive("")
 
     def render(self) -> Text:
         st = self.status
@@ -691,6 +706,8 @@ class StatusBar(Static):
         t.append("  │  ", style="dim")
         t.append("● ", style=state_color)
         t.append(st.state, style=f"bold {state_color}")
+        if self.awaiting and not self.stale:
+            t.append("  ⌛ awaiting telemetry", style="bold cyan")
         if self.stale:
             t.append("  ⚠ STALE", style="bold yellow")
         if self.sim:
@@ -699,6 +716,8 @@ class StatusBar(Static):
             t.append(f"  │  {st.port}", style="white")
         if st.baud:
             t.append(f" @ {st.baud}", style="dim")
+        if self.fw_info:
+            t.append(f"  │  fw: {self.fw_info}", style="green")
         if self.stats_text:
             t.append(f"  │  {self.stats_text}", style="dim")
         if st.detail:
@@ -1108,7 +1127,8 @@ class SettingsView(Container):
             for p in ports:
                 lines.append(f"  {p.device}   {p.description or ''}   [{p.hwid or ''}]")
         try:
-            self.query_one("#cfg-detected", Static).update("\n".join(lines))
+            # pass Text so brackets in hwid aren't parsed as Rich markup
+            self.query_one("#cfg-detected", Static).update(Text("\n".join(lines)))
         except Exception:
             pass
 
@@ -1271,6 +1291,15 @@ class EclipsePCRApp(App):
         if data is None:
             console.log(f"< {line}", style="dim")
             return
+
+        msg_type = data.get("type") if isinstance(data.get("type"), str) else None
+        if msg_type == "hello":
+            self._on_hello(data)
+            return
+        if msg_type == "info":
+            self._on_info(data)
+            return
+
         console.log(f"< {line}")
         self.query_one(DashboardView).apply_telemetry(data)
         try:
@@ -1285,6 +1314,28 @@ class EclipsePCRApp(App):
         if "err" in data or "error" in data:
             msg = data.get("err") or data.get("error")
             console.log(f"!! {msg}", style="bold red")
+
+    def _on_hello(self, data: dict[str, Any]) -> None:
+        fw = str(data.get("fw") or "unknown")
+        ver = str(data.get("version") or "?")
+        parts = [f"{fw} {ver}"]
+        for key in ("chip", "mpy", "mac", "reset_cause"):
+            v = data.get(key)
+            if v:
+                parts.append(f"{key}={v}")
+        self.query_one(ConsoleView).log("[fw] " + "  ".join(parts), style="bold green")
+        try:
+            self.query_one(StatusBar).fw_info = f"{fw} {ver}"
+        except Exception:
+            pass
+
+    def _on_info(self, data: dict[str, Any]) -> None:
+        parts = []
+        for key in ("fw", "version", "uptime_ms", "heap_free"):
+            v = data.get(key)
+            if v is not None:
+                parts.append(f"{key}={v}")
+        self.query_one(ConsoleView).log("[fw info] " + "  ".join(parts), style="cyan")
 
     def _on_serial_status(self, status: SerialStatus) -> None:
         try:
@@ -1604,10 +1655,13 @@ class EclipsePCRApp(App):
             sb = self.query_one(StatusBar)
             sb.stale = self._serial.stale
             s = self._serial
+            # Connected but the firmware hasn't said anything yet.
+            sb.awaiting = s.connected and s.lines_rx == 0
             if s.connected or s.bytes_rx > 0:
                 sb.stats_text = f"rx:{s.bytes_rx:,}B  tx:{s.bytes_tx:,}B  lines:{s.lines_rx:,}"
             else:
                 sb.stats_text = ""
+                sb.fw_info = ""
         except Exception:
             pass
 
@@ -1682,6 +1736,27 @@ def _safe_float(x) -> float | None:
         return v
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _friendly_serial_error(port: str, exc: BaseException) -> str:
+    """Turn a raw pyserial/OSError into a message with a concrete next step."""
+    msg = str(exc)
+    low = msg.lower()
+    if "permission denied" in low or (isinstance(exc, OSError) and getattr(exc, "errno", None) == 13):
+        hint = "sudo usermod -a -G dialout $USER  (then log out/in)"
+        if PLATFORM == "wsl":
+            hint += "  — or restart WSL after detach/attach"
+        return f"{msg}  |  {hint}"
+    if (
+        "no such file" in low
+        or "could not open port" in low
+        or (isinstance(exc, OSError) and getattr(exc, "errno", None) == 2)
+    ):
+        tail = wsl_helper_hint() if PLATFORM == "wsl" else f"port {port} not present; check USB"
+        return f"{msg}  |  {tail}"
+    if "device busy" in low or (isinstance(exc, OSError) and getattr(exc, "errno", None) == 16):
+        return f"{msg}  |  another program is holding the port (screen/minicom/esptool?)"
+    return msg
 
 # =====================================================================================
 # CLI

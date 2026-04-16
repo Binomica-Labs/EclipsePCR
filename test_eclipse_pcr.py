@@ -759,6 +759,38 @@ class TestTUI:
                 await pilot.press("ctrl+q")
 
     @pytest.mark.asyncio
+    async def test_hello_sets_fw_info(self, make_app):
+        app = make_app(simulate=False)
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            await pilot.pause()
+            sb = app.query_one(ecp.StatusBar)
+            dv = app.query_one(ecp.DashboardView)
+            before = dv.query_one("#tile-tc", ecp.Tile)._value
+            hello = '{"type":"hello","fw":"eclipse_pcr","version":"9.9.9","chip":"ESP32C6","mac":"58:e6:c5:12:e0:7c","reset_cause":"power_on"}'
+            app._on_serial_line(hello)
+            await pilot.pause()
+            assert sb.fw_info == "eclipse_pcr 9.9.9"
+            # hello must not be mistaken for a telemetry frame
+            assert dv.query_one("#tile-tc", ecp.Tile)._value == before
+            await pilot.press("ctrl+q")
+
+    @pytest.mark.asyncio
+    async def test_awaiting_flag_clears_after_telemetry(self, make_app):
+        app = make_app()
+        async with app.run_test(headless=True, size=(120, 40)) as pilot:
+            await pilot.pause()
+            sb = app.query_one(ecp.StatusBar)
+            # manually simulate "connected, zero lines" and then a frame
+            sb.awaiting = True
+            app._on_serial_line('{"tc": 25.0, "set": 95.0, "stage": "idle"}')
+            app._serial.lines_rx = 1  # pretend a line was counted
+            app._serial._status.state = "connected"
+            app._health_check()
+            await pilot.pause()
+            assert sb.awaiting is False
+            await pilot.press("ctrl+q")
+
+    @pytest.mark.asyncio
     async def test_dashboard_handles_bad_telemetry(self, make_app):
         app = make_app()
         async with app.run_test(headless=True, size=(120, 40)) as pilot:
